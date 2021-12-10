@@ -5,7 +5,10 @@ use {
         assert_initialized, assert_is_ata, assert_owned_by, spl_token_burn, spl_token_transfer,
         TokenBurnParams, TokenTransferParams,
     },
-    anchor_lang::{prelude::*, AnchorDeserialize, AnchorSerialize, Discriminator, Key},
+    anchor_lang::{
+        prelude::*, solana_program::log::sol_log_compute_units, AnchorDeserialize, AnchorSerialize,
+        Discriminator, Key,
+    },
     anchor_spl::token::Token,
     arrayref::array_ref,
     metaplex_token_metadata::{
@@ -15,9 +18,10 @@ use {
         },
     },
     spl_token::state::Mint,
-    std::cell::RefMut,
+    std::{cell::RefMut, str::FromStr},
 };
 anchor_lang::declare_id!("cndy3Z4yapfJBmL3ShUp5exZKqR3z33thTzeNMm2gRZ");
+const RECENT_BLOCKHASHES: &str = "SysvarRecentB1ockHashes11111111111111111111";
 
 const PREFIX: &str = "candy_machine";
 #[program]
@@ -42,16 +46,16 @@ pub mod nft_candy_machine_v2 {
         let recent_blockhashes = &ctx.accounts.recent_blockhashes;
         let mut price = candy_machine.data.price;
         if let Some(es) = &candy_machine.data.end_settings {
-            match es {
-                EndSettings::Date(date) => {
-                    if clock.unix_timestamp > *date {
+            match es.end_setting_type {
+                EndSettingType::Date => {
+                    if clock.unix_timestamp > es.number as i64 {
                         if *ctx.accounts.payer.key != candy_machine.authority {
                             return Err(ErrorCode::CandyMachineNotLive.into());
                         }
                     }
                 }
-                EndSettings::Amount(amount) => {
-                    if candy_machine.items_redeemed > *amount {
+                EndSettingType::Amount => {
+                    if candy_machine.items_redeemed > es.number {
                         return Err(ErrorCode::CandyMachineNotLive.into());
                     }
                 }
@@ -160,11 +164,10 @@ pub mod nft_candy_machine_v2 {
                 ],
             )?;
         }
+        let data = recent_blockhashes.data.borrow();
+        let most_recent = array_ref![data, 8, 8];
 
-        let most_recent = recent_blockhashes[0].blockhash;
-
-        let as_vec = most_recent.try_to_vec()?;
-        let index = u64::from_le_bytes(*array_ref![as_vec, 0, 8]);
+        let index = u64::from_le_bytes(*most_recent);
         let modded: usize = index
             .checked_rem(
                 candy_machine
@@ -224,6 +227,8 @@ pub mod nft_candy_machine_v2 {
             ctx.accounts.rent.to_account_info(),
             candy_machine_creator.to_account_info(),
         ];
+        msg!("Before metadata");
+        sol_log_compute_units();
 
         invoke_signed(
             &create_metadata_accounts(
@@ -245,6 +250,8 @@ pub mod nft_candy_machine_v2 {
             &[&authority_seeds],
         )?;
 
+        msg!("Before master");
+        sol_log_compute_units();
         invoke_signed(
             &create_master_edition(
                 *ctx.accounts.token_metadata_program.key,
@@ -266,6 +273,8 @@ pub mod nft_candy_machine_v2 {
             new_update_authority = Some(ctx.accounts.update_authority.key());
         }
 
+        msg!("Before update");
+        sol_log_compute_units();
         invoke_signed(
             &update_metadata_accounts(
                 *ctx.accounts.token_metadata_program.key,
@@ -293,12 +302,11 @@ pub mod nft_candy_machine_v2 {
         let candy_machine = &mut ctx.accounts.candy_machine;
 
         if data.items_available != candy_machine.data.items_available
-            && data.hidden_setting.is_none()
+            && data.hidden_settings.is_none()
         {
             return Err(ErrorCode::CannotChangeNumberOfLines.into());
         }
         candy_machine.data = data;
-
         Ok(())
     }
 
@@ -320,8 +328,8 @@ pub mod nft_candy_machine_v2 {
             return Err(ErrorCode::IndexGreaterThanLength.into());
         }
 
-        if candy_machine.data.hidden_setting.is_some() {
-            return Err(ErrorCode::HiddenSettingConfigsDoNotHaveConfigLines.into());
+        if candy_machine.data.hidden_settings.is_some() {
+            return Err(ErrorCode::HiddenSettingsConfigsDoNotHaveConfigLines.into());
         }
 
         for line in &config_lines {
@@ -336,7 +344,11 @@ pub mod nft_candy_machine_v2 {
                 array_of_zeroes.push(0u8);
             }
             let uri = line.uri.clone() + std::str::from_utf8(&array_of_zeroes).unwrap();
-            fixed_config_lines.push(ConfigLine { name, uri })
+            fixed_config_lines.push(ConfigLine {
+                used: false,
+                name,
+                uri,
+            })
         }
 
         let as_vec = fixed_config_lines.try_to_vec()?;
@@ -347,6 +359,15 @@ pub mod nft_candy_machine_v2 {
 
         let array_slice: &mut [u8] =
             &mut data[position..position + fixed_config_lines.len() * CONFIG_LINE_SIZE];
+
+        for i in 0..fixed_config_lines.len() {
+            // Record if the entry was used already into the new row
+            if array_slice[i * CONFIG_LINE_SIZE] == 1 {
+                msg!("Line {} already used, marking used", i);
+                fixed_config_lines[i].used = true;
+            }
+        }
+
         array_slice.copy_from_slice(serialized);
 
         let bit_mask_vec_start = CONFIG_ARRAY_START
@@ -497,7 +518,7 @@ pub mod nft_candy_machine_v2 {
 }
 
 fn get_space_for_candy(data: CandyMachineData) -> core::result::Result<usize, ProgramError> {
-    let num = if data.hidden_setting.is_some() {
+    let num = if data.hidden_settings.is_some() {
         CONFIG_ARRAY_START
     } else {
         CONFIG_ARRAY_START
@@ -568,7 +589,8 @@ pub struct MintNFT<'info> {
     system_program: Program<'info, System>,
     rent: Sysvar<'info, Rent>,
     clock: Sysvar<'info, Clock>,
-    recent_blockhashes: Sysvar<'info, RecentBlockhashes>,
+    #[account(address = Pubkey::from_str(RECENT_BLOCKHASHES).unwrap())]
+    recent_blockhashes: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -582,6 +604,7 @@ pub struct UpdateCandyMachine<'info> {
 }
 
 #[account]
+#[derive(Default)]
 pub struct CandyMachine {
     pub authority: Pubkey,
     pub wallet: Pubkey,
@@ -611,7 +634,7 @@ pub enum WhitelistMintMode {
     NeverBurn,
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct CandyMachineData {
     pub uuid: String,
     pub price: u64,
@@ -626,15 +649,21 @@ pub struct CandyMachineData {
     pub go_live_date: Option<i64>,
     pub end_settings: Option<EndSettings>,
     pub creators: Vec<Creator>,
-    pub hidden_setting: Option<HiddenSetting>,
+    pub hidden_settings: Option<HiddenSettings>,
     pub whitelist_mint_settings: Option<WhitelistMintSettings>,
     pub items_available: u64,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub enum EndSettings {
-    Date(i64),
-    Amount(u64),
+pub enum EndSettingType {
+    Date,
+    Amount,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct EndSettings {
+    end_setting_type: EndSettingType,
+    number: u64,
 }
 
 pub const CONFIG_ARRAY_START: usize = 8 + // key
@@ -648,7 +677,7 @@ pub const CONFIG_ARRAY_START: usize = 8 + // key
 10 + // end settings
 4 + MAX_SYMBOL_LENGTH + // u32 len + symbol
 2 + // seller fee basis points
-1 + 4 + MAX_CREATOR_LIMIT*MAX_CREATOR_LEN + // optional + u32 len + actual vec
+4 + MAX_CREATOR_LIMIT*MAX_CREATOR_LEN + // optional + u32 len + actual vec
 8 + //max supply
 1 + // is mutable
 1 + // retain authority
@@ -666,7 +695,7 @@ pub const CONFIG_ARRAY_START: usize = 8 + // key
 32; // mint key for whitelist
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
-pub struct HiddenSetting {
+pub struct HiddenSettings {
     name: String,
     uri: String,
     hash: [u8; 32],
@@ -681,46 +710,86 @@ pub fn get_config_line<'info>(
     index: usize,
     mint_number: u64,
 ) -> core::result::Result<ConfigLine, ProgramError> {
-    if let Some(hs) = &a.data.hidden_setting {
+    if let Some(hs) = &a.data.hidden_settings {
         return Ok(ConfigLine {
+            used: false,
             name: hs.name.clone() + "#" + &(mint_number + 1).to_string(),
             uri: hs.uri.clone(),
         });
     }
-
+    msg!("Index is set to {:?}", index);
     let a_info = a.to_account_info();
+
     let mut arr = a_info.data.borrow_mut();
 
-    let total = get_config_count(&arr)?;
-    if index > total {
-        return Err(ErrorCode::IndexGreaterThanLength.into());
-    }
-    let data_array = &mut arr[CONFIG_ARRAY_START + 4 + index * (CONFIG_LINE_SIZE)
-        ..CONFIG_ARRAY_START + 4 + (index + 1) * (CONFIG_LINE_SIZE)];
-
-    let config_line: ConfigLine = ConfigLine::try_from_slice(data_array)?;
-
-    let snippet = (arr
-        [CONFIG_ARRAY_START + 4 + (index + 1) * (CONFIG_LINE_SIZE)..a_info.data_len()])
-        .try_to_vec()?;
-    let to_overwrite = &mut arr
-        [CONFIG_ARRAY_START + 4 + index * (CONFIG_LINE_SIZE)..a_info.data_len() - CONFIG_LINE_SIZE];
-    // shift snippet up and cut out the config used.
-    to_overwrite.copy_from_slice(&snippet);
-
-    let all_zeroes = &mut arr[a_info.data_len() - CONFIG_LINE_SIZE..a_info.data_len()];
-    for i in 0..all_zeroes.len() {
-        all_zeroes[i] = 0;
+    let mut index_to_use = index;
+    let mut found = false;
+    let items_available = a.data.items_available as usize;
+    while arr[CONFIG_ARRAY_START + 4 + index_to_use * (CONFIG_LINE_SIZE)] == 1 {
+        index_to_use += 1;
+        if index_to_use == items_available {
+            break;
+        } else if arr[CONFIG_ARRAY_START + 4 + index_to_use * (CONFIG_LINE_SIZE)] == 0 {
+            found = true
+        }
     }
 
-    arr[CONFIG_ARRAY_START..CONFIG_ARRAY_START + 4].copy_from_slice(&(total - 1).to_le_bytes());
+    if !found {
+        index_to_use = index;
+        while arr[CONFIG_ARRAY_START + 4 + index_to_use * (CONFIG_LINE_SIZE)] == 1 {
+            index_to_use -= 1;
+            if index_to_use == 0 {
+                break;
+            }
+        }
+    }
+
+    msg!(
+        "Index actually ends up due to used bools {:?}",
+        index_to_use
+    );
+    if arr[CONFIG_ARRAY_START + 4 + index_to_use * (CONFIG_LINE_SIZE)] == 1 {
+        return Err(ErrorCode::CannotFindUsableConfigLine.into());
+    }
+
+    let data_array = &mut arr[CONFIG_ARRAY_START + 4 + index_to_use * (CONFIG_LINE_SIZE)
+        ..CONFIG_ARRAY_START + 4 + (index_to_use + 1) * (CONFIG_LINE_SIZE)];
+
+    let mut name_vec = vec![];
+    let mut uri_vec = vec![];
+    for i in 5..5 + MAX_NAME_LENGTH {
+        if data_array[i] == 0 {
+            break;
+        }
+        name_vec.push(data_array[i])
+    }
+    for i in 9 + MAX_NAME_LENGTH..9 + MAX_NAME_LENGTH + MAX_URI_LENGTH {
+        if data_array[i] == 0 {
+            break;
+        }
+        uri_vec.push(data_array[i])
+    }
+    let config_line: ConfigLine = ConfigLine {
+        used: false,
+        name: match String::from_utf8(name_vec) {
+            Ok(val) => val,
+            Err(_) => return Err(ErrorCode::InvalidString.into()),
+        },
+        uri: match String::from_utf8(uri_vec) {
+            Ok(val) => val,
+            Err(e) => return Err(ErrorCode::InvalidString.into()),
+        },
+    };
+
+    arr[CONFIG_ARRAY_START + 4 + index_to_use * (CONFIG_LINE_SIZE)] = 1;
 
     Ok(config_line)
 }
 
-pub const CONFIG_LINE_SIZE: usize = 4 + MAX_NAME_LENGTH + 4 + MAX_URI_LENGTH;
+pub const CONFIG_LINE_SIZE: usize = 1 + 4 + MAX_NAME_LENGTH + 4 + MAX_URI_LENGTH;
 #[derive(AnchorSerialize, AnchorDeserialize, Debug)]
 pub struct ConfigLine {
+    pub used: bool,
     /// The name of the asset
     pub name: String,
     /// URI pointing to JSON representing the asset
@@ -764,7 +833,7 @@ pub enum ErrorCode {
     #[msg("Candy machine is not live!")]
     CandyMachineNotLive,
     #[msg("Configs that are using hidden uris do not have config lines, they have a single hash representing hashed order")]
-    HiddenSettingConfigsDoNotHaveConfigLines,
+    HiddenSettingsConfigsDoNotHaveConfigLines,
     #[msg("Cannot change number of lines unless is a hidden config")]
     CannotChangeNumberOfLines,
     #[msg("Derived key invalid")]
@@ -775,4 +844,8 @@ pub enum ErrorCode {
     NoWhitelistToken,
     #[msg("Token burn failed")]
     TokenBurnFailed,
+    #[msg("Unable to find an unused config line near your random number index")]
+    CannotFindUsableConfigLine,
+    #[msg("Invalid string")]
+    InvalidString,
 }
